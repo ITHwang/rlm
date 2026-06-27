@@ -162,6 +162,7 @@ class LocalREPL(NonIsolatedEnv):
         custom_sub_tools: dict[str, Any] | None = None,
         compaction: bool = False,
         max_concurrent_subcalls: int = 4,
+        deterministic_seed: int | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -179,6 +180,10 @@ class LocalREPL(NonIsolatedEnv):
         self._context_count: int = 0
         self._history_count: int = 0
         self.compaction = compaction
+        # When set, RNGs are seeded before each code execution so deterministic
+        # replay reproduces the recorded trajectory (RLM Lab, PRD 006). Default
+        # None keeps stock behavior unchanged.
+        self.deterministic_seed = deterministic_seed
 
         # Custom tools: functions available in the REPL
         self.custom_tools = custom_tools or {}
@@ -544,6 +549,23 @@ class LocalREPL(NonIsolatedEnv):
             elif name == "history" and self.compaction:
                 self.locals["history"] = self._compaction_history
 
+    def _seed_determinism(self) -> None:
+        """Seed RNGs before executing model code so replay reproduces recording.
+
+        Only the in-process ``random`` (and ``numpy`` if present) can be seeded at
+        runtime; ``PYTHONHASHSEED`` must be set at process launch (the RLM Lab
+        benchmark / Docker deployment does this). See PRD 006.
+        """
+        import random as _random
+
+        _random.seed(self.deterministic_seed)
+        try:
+            import numpy as _np
+
+            _np.random.seed(self.deterministic_seed)
+        except Exception:
+            pass
+
     def execute_code(self, code: str) -> REPLResult:
         """Execute code in the persistent namespace and return result."""
         start_time = time.perf_counter()
@@ -554,6 +576,8 @@ class LocalREPL(NonIsolatedEnv):
         with self._capture_output() as (stdout_buf, stderr_buf), self._temp_cwd():
             try:
                 combined = {**self.globals, **self.locals}
+                if self.deterministic_seed is not None:
+                    self._seed_determinism()
                 exec(code, combined, combined)
 
                 # Update locals with new variables
