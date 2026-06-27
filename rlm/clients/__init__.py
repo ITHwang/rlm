@@ -57,7 +57,15 @@ def get_client(
         from rlm.clients.litellm_responses import LiteLLMResponsesClient
 
         return LiteLLMResponsesClient(**backend_kwargs)
+    elif backend == "record":
+        from rlm.clients.record import RecordingLM
+
+        return RecordingLM(**backend_kwargs)
+    elif backend == "replay":
+        from rlm.clients.replay import MockLM
+
+        return MockLM(**backend_kwargs)
     else:
         raise ValueError(
-            f"Unknown backend: {backend}. Supported backends: ['openai', 'vllm', 'portkey', 'openrouter', 'anthropic', 'azure_openai', 'gemini', 'vercel', 'litellm_responses']"
+            f"Unknown backend: {backend}. Supported backends: ['openai', 'vllm', 'portkey', 'openrouter', 'anthropic', 'azure_openai', 'gemini', 'vercel', 'litellm_responses', 'record', 'replay']"
         )

@@ -12,6 +12,10 @@ ClientBackend = Literal[
     "azure_openai",
     "gemini",
     "litellm_responses",
+    # Deterministic-replay benchmark backends (RLM Lab, PRD 006). Additive:
+    # "record" wraps a real backend to capture responses; "replay" returns them.
+    "record",
+    "replay",
 ]
 EnvironmentType = Literal["local", "ipython", "docker", "modal", "prime", "daytona", "e2b"]
 
