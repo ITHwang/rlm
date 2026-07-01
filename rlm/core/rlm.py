@@ -882,7 +882,7 @@ class RLM:
             ValueError: If the environment type does not support persistent mode.
         """
         # Known environments that support persistence
-        persistent_supported_environments = {"local", "ipython"}
+        persistent_supported_environments = {"local", "ipython", "daytona_warm"}
 
         if self.environment_type not in persistent_supported_environments:
             raise ValueError(

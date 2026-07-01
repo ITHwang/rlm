@@ -43,7 +43,16 @@ __all__ = [
 
 
 def get_environment(
-    environment: Literal["local", "ipython", "modal", "docker", "daytona", "prime", "e2b"],
+    environment: Literal[
+        "local",
+        "ipython",
+        "modal",
+        "docker",
+        "daytona",
+        "daytona_warm",
+        "prime",
+        "e2b",
+    ],
     environment_kwargs: dict[str, Any],
 ) -> BaseEnv:
     """
@@ -68,6 +77,10 @@ def get_environment(
         from rlm.environments.daytona_repl import DaytonaREPL
 
         return DaytonaREPL(**environment_kwargs)
+    elif environment == "daytona_warm":
+        from rlm.environments.daytona_warm_repl import DaytonaWarmREPL
+
+        return DaytonaWarmREPL(**environment_kwargs)
     elif environment == "prime":
         from rlm.environments.prime_repl import PrimeREPL
 

@@ -17,7 +17,16 @@ ClientBackend = Literal[
     "record",
     "replay",
 ]
-EnvironmentType = Literal["local", "ipython", "docker", "modal", "prime", "daytona", "e2b"]
+EnvironmentType = Literal[
+    "local",
+    "ipython",
+    "docker",
+    "modal",
+    "prime",
+    "daytona",
+    "daytona_warm",
+    "e2b",
+]
 
 
 def _serialize_value(value: Any) -> Any:
