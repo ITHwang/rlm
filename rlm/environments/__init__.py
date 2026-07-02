@@ -52,6 +52,7 @@ def get_environment(
         "daytona_warm",
         "prime",
         "e2b",
+        "py_wasm",
     ],
     environment_kwargs: dict[str, Any],
 ) -> BaseEnv:
@@ -89,7 +90,11 @@ def get_environment(
         from rlm.environments.e2b_repl import E2BREPL
 
         return E2BREPL(**environment_kwargs)
+    elif environment == "py_wasm":
+        from rlm.environments.py_wasm_repl import PyWasmEnv
+
+        return PyWasmEnv(**environment_kwargs)
     else:
         raise ValueError(
-            f"Unknown environment: {environment}. Supported: ['local', 'ipython', 'modal', 'docker', 'daytona', 'prime', 'e2b']"
+            f"Unknown environment: {environment}. Supported: ['local', 'ipython', 'modal', 'docker', 'daytona', 'daytona_warm', 'prime', 'e2b', 'py_wasm']"
         )

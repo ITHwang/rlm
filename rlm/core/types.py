@@ -26,6 +26,7 @@ EnvironmentType = Literal[
     "daytona",
     "daytona_warm",
     "e2b",
+    "py_wasm",
 ]
 
 
