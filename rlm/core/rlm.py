@@ -273,7 +273,7 @@ class RLM:
             env_kwargs["context_payload"] = prompt
             env_kwargs["depth"] = self.depth + 1  # Environment depth is RLM depth + 1
             # For local/ipython environments with max_depth > 1, pass subcall callback for recursive RLM calls
-            if self.environment_type in ("local", "ipython") and self.max_depth > 1:
+            if self.environment_type in ("local", "ipython", "py_wasm") and self.max_depth > 1:
                 env_kwargs["subcall_fn"] = self._subcall
             # Pass custom tools to the environment
             if self.custom_tools is not None:
@@ -467,7 +467,11 @@ class RLM:
 
             # Default behavior: we run out of iterations, provide one final answer
             time_end = time.perf_counter()
-            final_answer = self._default_answer(message_history, lm_handler)
+            final_answer = self._default_answer(
+                message_history,
+                lm_handler,
+                environment,
+            )
             usage = lm_handler.get_usage_summary()
             self.verbose.print_final_answer(final_answer)
             self.verbose.print_summary(self.max_iterations, time_end - time_start, usage.to_dict())
@@ -622,7 +626,11 @@ class RLM:
                 ),
             }
         ]
-        summary = lm_handler.completion(summary_prompt)
+        self._begin_environment_inter_turn_idle(environment)
+        try:
+            summary = lm_handler.completion(summary_prompt)
+        finally:
+            self._end_environment_inter_turn_idle(environment)
         if hasattr(environment, "append_compaction_entry"):
             environment.append_compaction_entry({"type": "summary", "content": summary})
         # Keep system + initial assistant (metadata), then summary + continue
@@ -652,7 +660,11 @@ class RLM:
         and code execution + tool execution.
         """
         iter_start = time.perf_counter()
-        response = lm_handler.completion(prompt)
+        self._begin_environment_inter_turn_idle(environment)
+        try:
+            response = lm_handler.completion(prompt)
+        finally:
+            self._end_environment_inter_turn_idle(environment)
         code_block_strs = find_code_blocks(response)
         code_blocks = []
 
@@ -668,7 +680,12 @@ class RLM:
             iteration_time=iteration_time,
         )
 
-    def _default_answer(self, message_history: list[dict[str, Any]], lm_handler: LMHandler) -> str:
+    def _default_answer(
+        self,
+        message_history: list[dict[str, Any]],
+        lm_handler: LMHandler,
+        environment: BaseEnv | None = None,
+    ) -> str:
         """
         Default behavior if the RLM runs out of iterations and does not find a final answer.
         It will take the message history, and try to generate a final answer from it.
@@ -679,7 +696,13 @@ class RLM:
                 "content": "Please provide a final answer to the user's question based on the information provided.",
             }
         ]
-        response = lm_handler.completion(current_prompt)
+        if environment is not None:
+            self._begin_environment_inter_turn_idle(environment)
+        try:
+            response = lm_handler.completion(current_prompt)
+        finally:
+            if environment is not None:
+                self._end_environment_inter_turn_idle(environment)
 
         if self.logger:
             self.logger.log(
@@ -692,6 +715,18 @@ class RLM:
             )
 
         return response
+
+    @staticmethod
+    def _begin_environment_inter_turn_idle(environment: BaseEnv) -> None:
+        begin_idle = getattr(environment, "begin_inter_turn_idle", None)
+        if callable(begin_idle):
+            begin_idle()
+
+    @staticmethod
+    def _end_environment_inter_turn_idle(environment: BaseEnv) -> None:
+        end_idle = getattr(environment, "end_inter_turn_idle", None)
+        if callable(end_idle):
+            end_idle()
 
     def _fallback_answer(self, message: str | dict[str, Any]) -> str:
         """
@@ -882,7 +917,7 @@ class RLM:
             ValueError: If the environment type does not support persistent mode.
         """
         # Known environments that support persistence
-        persistent_supported_environments = {"local", "ipython", "daytona_warm"}
+        persistent_supported_environments = {"local", "ipython", "daytona_warm", "py_wasm"}
 
         if self.environment_type not in persistent_supported_environments:
             raise ValueError(
