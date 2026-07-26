@@ -177,6 +177,15 @@ class LocalREPL(NonIsolatedEnv):
         self.original_cwd = os.getcwd()
         self.temp_dir = tempfile.mkdtemp(prefix=f"repl_env_{uuid.uuid4()}_")
         self._lock = threading.Lock()
+        # Inter-turn idle instrumentation (RLM Lab, BR002-WO002): mirrors
+        # PyWasmEnv's timing fields so native and wasm idle structure compare
+        # directly. Mid-execute park is deliberately NOT instrumented here
+        # (BR002-CL005) — active_seconds therefore includes nested llm_query
+        # waits and is an upper bound on true active time.
+        self._timing_lock = threading.Lock()
+        self._timing = self._new_idle_timing()
+        self._last_execute_ended_at: float | None = None
+        self._inter_turn_idle_started_at: float | None = None
         self._context_count: int = 0
         self._history_count: int = 0
         self.compaction = compaction
@@ -597,14 +606,88 @@ class LocalREPL(NonIsolatedEnv):
         final_answer = self._last_final_answer
         self._last_final_answer = None
 
+        end_time = time.perf_counter()
+        with self._timing_lock:
+            wall = max(0.0, end_time - start_time)
+            self._timing["execute_wall_seconds"] += wall
+            self._timing["active_seconds"] += wall
+            self._timing["execute_count"] += 1
+            self._last_execute_ended_at = end_time
+
         return REPLResult(
             stdout=stdout,
             stderr=stderr,
             locals=self.locals.copy(),
-            execution_time=time.perf_counter() - start_time,
+            execution_time=end_time - start_time,
             rlm_calls=self._pending_llm_calls.copy(),
             final_answer=final_answer,
         )
+
+    # -- Inter-turn idle instrumentation (RLM Lab, BR002-WO002) ------------- #
+
+    @staticmethod
+    def _new_idle_timing() -> dict[str, float | int]:
+        return {
+            "execute_wall_seconds": 0.0,
+            "active_seconds": 0.0,
+            "mid_execute_park_seconds": 0.0,  # not instrumented (BR002-CL005)
+            "inter_turn_idle_seconds": 0.0,
+            "execute_count": 0,
+            "mid_execute_park_count": 0,
+            "inter_turn_idle_count": 0,
+        }
+
+    def reset_idle_timing(self) -> None:
+        with self._timing_lock:
+            self._timing = self._new_idle_timing()
+            self._last_execute_ended_at = None
+            self._inter_turn_idle_started_at = None
+
+    def begin_inter_turn_idle(self) -> None:
+        """Mark that the session is awaiting the next root-model response.
+
+        Idle is backdated to the last execute's end so the interval matches
+        PyWasmEnv's boundary (execute-return -> next code execution). The
+        initial root wait (no prior REPL state) is deliberately not counted.
+        """
+        with self._timing_lock:
+            if (
+                self._last_execute_ended_at is not None
+                and self._inter_turn_idle_started_at is None
+            ):
+                self._inter_turn_idle_started_at = self._last_execute_ended_at
+
+    def end_inter_turn_idle(self) -> None:
+        with self._timing_lock:
+            if self._inter_turn_idle_started_at is None:
+                return
+            now = time.perf_counter()
+            self._timing["inter_turn_idle_seconds"] += max(
+                0.0, now - self._inter_turn_idle_started_at
+            )
+            self._timing["inter_turn_idle_count"] += 1
+            self._inter_turn_idle_started_at = None
+            self._last_execute_ended_at = None
+
+    def runtime_timing(self) -> dict[str, Any]:
+        with self._timing_lock:
+            timing = dict(self._timing)
+            if self._inter_turn_idle_started_at is not None:
+                timing["inter_turn_idle_seconds"] += max(
+                    0.0, time.perf_counter() - self._inter_turn_idle_started_at
+                )
+        active = float(timing["active_seconds"])
+        inter_turn = float(timing["inter_turn_idle_seconds"])
+        mid_execute = float(timing["mid_execute_park_seconds"])
+        observed = active + inter_turn + mid_execute
+        timing["observed_seconds"] = observed
+        timing["active_fraction"] = active / observed if observed else 0.0
+        timing["inter_turn_idle_fraction"] = inter_turn / observed if observed else 0.0
+        timing["mid_execute_park_fraction"] = (
+            mid_execute / observed if observed else 0.0
+        )
+        timing["mid_execute_park_instrumented"] = False
+        return timing
 
     def __enter__(self):
         return self

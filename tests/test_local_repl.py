@@ -291,3 +291,70 @@ class TestLocalREPLSimulatingRLMNoPersistence:
         assert "NameError" in result.stderr
         assert "my_helper" in result.stderr
         completion_2_env.cleanup()
+
+
+class TestLocalREPLIdleTiming:
+    """Inter-turn idle instrumentation (RLM Lab, BR002-WO002) — mirrors the
+    PyWasmEnv timing contract on the native env."""
+
+    def test_execute_accumulates_active_time(self):
+        repl = LocalREPL()
+        try:
+            repl.execute_code("x = 1")
+            timing = repl.runtime_timing()
+            assert timing["execute_count"] == 1
+            assert timing["active_seconds"] > 0.0
+            assert timing["execute_wall_seconds"] == timing["active_seconds"]
+            assert timing["mid_execute_park_instrumented"] is False
+        finally:
+            repl.cleanup()
+
+    def test_inter_turn_idle_backdates_to_last_execute_end(self):
+        import time as _time
+
+        repl = LocalREPL()
+        try:
+            repl.execute_code("x = 1")
+            _time.sleep(0.05)
+            repl.begin_inter_turn_idle()  # backdates to the execute end
+            repl.end_inter_turn_idle()
+            timing = repl.runtime_timing()
+            assert timing["inter_turn_idle_count"] == 1
+            assert timing["inter_turn_idle_seconds"] >= 0.04
+        finally:
+            repl.cleanup()
+
+    def test_initial_root_wait_is_uncounted(self):
+        repl = LocalREPL()
+        try:
+            repl.begin_inter_turn_idle()  # no execute yet -> not an idle window
+            repl.end_inter_turn_idle()
+            assert repl.runtime_timing()["inter_turn_idle_count"] == 0
+        finally:
+            repl.cleanup()
+
+    def test_open_idle_window_included_in_runtime_timing(self):
+        repl = LocalREPL()
+        try:
+            repl.execute_code("x = 1")
+            repl.begin_inter_turn_idle()
+            timing = repl.runtime_timing()  # window still open
+            assert timing["inter_turn_idle_seconds"] >= 0.0
+            assert timing["active_fraction"] <= 1.0
+        finally:
+            repl.cleanup()
+
+    def test_reset_idle_timing_clears_all_counters(self):
+        repl = LocalREPL()
+        try:
+            repl.execute_code("x = 1")
+            repl.begin_inter_turn_idle()
+            repl.end_inter_turn_idle()
+            repl.reset_idle_timing()
+            timing = repl.runtime_timing()
+            assert timing["execute_count"] == 0
+            assert timing["active_seconds"] == 0.0
+            assert timing["inter_turn_idle_count"] == 0
+            assert timing["inter_turn_idle_seconds"] == 0.0
+        finally:
+            repl.cleanup()

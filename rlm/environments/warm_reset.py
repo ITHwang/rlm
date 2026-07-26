@@ -53,3 +53,9 @@ def reset_for_request(env: "LocalREPL") -> None:
     if env.compaction:
         env._compaction_history = []
         env.locals["history"] = env._compaction_history
+
+    # Reset per-request idle timing (RLM Lab, BR002-WO002) so a reused warm env
+    # reports each task's idle structure like a fresh environment.
+    reset_timing = getattr(env, "reset_idle_timing", None)
+    if callable(reset_timing):
+        reset_timing()
