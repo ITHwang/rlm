@@ -328,3 +328,79 @@ def test_classes_pass_through_unwrapped(tmp_path):
     assert len(hits) == 30
     assert escape_snapshot().get("escape:c-level:re.finditer") == 1
     escape_reset()
+
+
+def test_local_repl_externalized_bind(tmp_path):
+    """E3 integration: StoreRef payload binds a LazyStr view in the guest."""
+    from rlm.environments.local_repl import LocalREPL
+
+    store = ContextStore(tmp_path / "store")
+    text = "alpha beta 🦊 gamma\n" * 200
+    src = tmp_path / "doc.txt"
+    src.write_text(text, encoding="utf-8")
+    store.ingest_file(src, name="doc")
+    ref = StoreRef.from_index(store.root, "doc")
+
+    env = LocalREPL(context_mode="externalized")
+    env.add_context(ref)
+    assert type(env.locals["context_0"]).__name__ == "LazyStr"
+    assert env.locals["context"] is env.locals["context_0"]
+
+    res = env.execute_code(
+        "n = len(context)\n"
+        "hit = context.find('beta')\n"
+        "sl = context[6:10]\n"
+        "has = '🦊' in context\n"
+        "print(n, hit, sl, has)"
+    )
+    assert res.stderr.strip() == ""
+    n, hit, sl, has = res.stdout.split()
+    assert int(n) == len(text)
+    assert int(hit) == text.find("beta")
+    assert sl == text[6:10]
+    assert has == "True"
+
+    # scaffold restore keeps `context` aliased to the view across turns
+    env.execute_code("context = 'clobbered'")
+    res2 = env.execute_code("print(len(context))")
+    assert int(res2.stdout.strip()) == len(text)
+
+
+
+
+def test_pathref_lane_binds_stock_str(tmp_path):
+    """Cheap-alternative control: PathRef passes a path; the guest does the
+    stock f.read() — real str, no store, no coercion shim, no escapes."""
+    import builtins
+
+    from rlm.environments.local_repl import LocalREPL
+
+    text = "alpha beta 🦊 gamma\n" * 300
+    src = tmp_path / "ctx.txt"
+    src.write_text(text, encoding="utf-8")
+    ref = PathRef(str(src), src.stat().st_size)
+    assert ref.context_char_count == src.stat().st_size  # byte bound, documented
+
+    escape_reset()
+    env = LocalREPL(context_mode="path")
+    env.add_context(ref)
+
+    ctx = env.locals["context_0"]
+    assert type(ctx) is str                      # exact str, not a view
+    assert ctx == text
+    assert env.locals["context"] is ctx
+    # stock __import__ must survive: no coercion shim in this lane
+    assert env.globals["__builtins__"]["__import__"] is builtins.__import__
+
+    res = env.execute_code(
+        "import re\n"
+        "n = len(context)\n"
+        "hits = len(list(re.finditer(r'beta', context)))\n"
+        "print(n, hits, context[6:10])"
+    )
+    assert res.stderr.strip() == ""
+    n, hits, sl = res.stdout.split()
+    assert int(n) == len(text)
+    assert int(hits) == text.count("beta")
+    assert sl == text[6:10]
+    assert escape_snapshot() == {}                # no façade, so no façade cost

@@ -163,6 +163,7 @@ class LocalREPL(NonIsolatedEnv):
         compaction: bool = False,
         max_concurrent_subcalls: int = 4,
         deterministic_seed: int | None = None,
+        context_mode: str = "legacy",
         **kwargs,
     ):
         super().__init__(
@@ -193,6 +194,12 @@ class LocalREPL(NonIsolatedEnv):
         # replay reproduces the recorded trajectory (RLM Lab, PRD 006). Default
         # None keeps stock behavior unchanged.
         self.deterministic_seed = deterministic_seed
+        # Context binding mode (RLM Lab, BR002-WO003). "legacy" = stock
+        # temp-file + f.read() bind; "externalized" only changes behavior when
+        # the payload is a StoreRef (lazy mmap view bind); "census" = legacy
+        # bind wrapped in RecorderStr for the E1c op census. Default "legacy"
+        # keeps stock behavior unchanged.
+        self.context_mode = context_mode
 
         # Custom tools: functions available in the REPL
         self.custom_tools = custom_tools or {}
@@ -432,11 +439,54 @@ class LocalREPL(NonIsolatedEnv):
 
         var_name = f"context_{context_index}"
 
+        # Externalized bind (RLM Lab, BR002-WO003): a StoreRef payload binds a
+        # LazyStr view over the read-only mmap'd store segment — no payload
+        # copy in host or guest heap. Guest code runs in-process (a namespace
+        # dict), so a host-side bind is identical to an exec'd assignment; the
+        # scaffold restore keeps `context` aliased to `context_0` every turn.
+        from rlm.context_store import PathRef, StoreRef  # additive, cycle-free
+
+        # PathRef bind (BR002-WO003 follow-up): the *cheap alternative* control.
+        # Handle passing without the store — the guest runs the stock
+        # `f.read()` bind against the ORIGINAL context file, so no host-side
+        # copy exists and no temp copy is written. Isolates how much of the
+        # measured saving belongs to handle passing rather than to the store.
+        if isinstance(context_payload, PathRef):
+            self.execute_code(
+                f"with open(r'{context_payload.path}', 'r', encoding='utf-8') as f:\n"
+                f"    {var_name} = f.read()"
+            )
+            if context_index == 0:
+                self.execute_code(f"context = {var_name}")
+            self._context_count = max(self._context_count, context_index + 1)
+            return context_index
+
+        if isinstance(context_payload, StoreRef):
+            from rlm.context_store import make_coercing_import
+
+            view = context_payload.open()
+            self.locals[var_name] = view
+            if context_index == 0:
+                self.locals["context"] = view
+            # C-level exact-str demands (e.g. re.finditer(pat, ctx)) cannot
+            # consume a lazy view; per FR002 they full-materialize through the
+            # logged escape hatch instead of raising (BR002-WO003 E3 finding).
+            self.globals["__builtins__"]["__import__"] = make_coercing_import()
+            self._context_count = max(self._context_count, context_index + 1)
+            return context_index
+
         if isinstance(context_payload, str):
             context_path = os.path.join(self.temp_dir, f"context_{context_index}.txt")
             with open(context_path, "w") as f:
                 f.write(context_payload)
             self.execute_code(f"with open(r'{context_path}', 'r') as f:\n    {var_name} = f.read()")
+            if self.context_mode == "census":
+                # E1c op census (D-b): wrap the guest str in RecorderStr — a
+                # real str, so zero compat risk; Python-level ops are counted.
+                from rlm.context_store import RecorderStr
+
+                wrapped = RecorderStr(self.locals[var_name])
+                self.locals[var_name] = wrapped
         else:
             context_path = os.path.join(self.temp_dir, f"context_{context_index}.json")
             with open(context_path, "w") as f:
