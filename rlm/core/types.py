@@ -286,6 +286,12 @@ class QueryMetadata:
         if isinstance(prompt, str):
             self.context_lengths = [len(prompt)]
             self.context_type = "str"
+        elif hasattr(prompt, "context_char_count"):
+            # Externalized context handle (RLM Lab, BR002-WO003): a StoreRef /
+            # lazy view stands in for the str payload; metadata stays
+            # byte-identical to the recorded str run (same length, same type).
+            self.context_lengths = [int(prompt.context_char_count)]
+            self.context_type = "str"
         elif isinstance(prompt, dict):
             self.context_type = "dict"
             self.context_lengths = []
