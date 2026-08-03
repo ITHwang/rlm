@@ -35,6 +35,13 @@ from __future__ import annotations
 import mmap
 import os
 import re
+
+try:  # CPython >= 3.11 exposes the sre internals here
+    from re import _constants as _sre_c
+    from re import _parser as _sre_p
+except ImportError:  # pragma: no cover - older interpreters
+    import sre_constants as _sre_c  # type: ignore[no-redef]
+    import sre_parse as _sre_p  # type: ignore[no-redef]
 from array import array
 from collections import Counter
 from pathlib import Path
@@ -547,6 +554,174 @@ def _needs_full_subject(pattern: str) -> bool:
     return False
 
 
+# --------------------------------------------------------------------------- #
+# tier-2 admission — the tail-position partition (BR002-FR006-CL004's successor
+# item, built 2026-08-03 after ABR rounds 10-11 measured the corpus VIOLATING
+# the unpartitioned tier's precondition)
+# --------------------------------------------------------------------------- #
+# The window fails in exactly one place: a match longer than the overlap can be
+# TRUNCATED by the window edge, and a truncated attempt that *fails* leaves no
+# trace — "no match" and "no match because it broke" are the same observation
+# (five detection schemes died to counterexamples in ABR rounds 4-8). But the
+# failure is only untraceable when something consuming FOLLOWS the long part:
+# `A.*B` truncated loses `B` and evaporates. When every unbounded repeat sits
+# in TAIL position (`A.*` — nothing consuming follows on any alternation path),
+# a truncated attempt necessarily ends at the window's last character, which is
+# the `m.end() == len(text)` signal `_windowed_finditer` already computes and
+# escalates on. So the partition is the detectability boundary itself:
+#
+#   COMPOSITE max width <= overlap           -> tier 2 (the overlap argument)
+#   wide, and shaped as NARROW PREFIX +
+#     ONE width-1-body tail repeat, where
+#     prefix and prefix+engaged-minimum
+#     both fit the overlap                    -> tier 2 (edge signal catches it)
+#   anything else                             -> tier 3 (exact by construction)
+#
+# The rule is deliberately COMPOSITE — ABR 260803-2100 demonstrated silent
+# divergences twice, and both times the per-unit version of a guard was the
+# hole: round 1 with single units (multi-char bodies retreating past the
+# alarm; an optional hiding a wide minimum), round 2 with compositions of
+# narrow pieces (a chain of narrow repeats + trailing consumer losing a match;
+# a byte-inflated prefix starving an engaged optional into a wrong span). All
+# widths are summed and compared in characters against overlap/4, so the ×4
+# UTF-8 bound applies to the SUM in bytes — conservative in the safe
+# direction, as is every unknown construct below.
+_WIDE = 1 << 62
+
+
+def _sat(n: int) -> int:
+    return _WIDE if n > _WIDE else n
+
+
+def _node_widths(item, gw: dict) -> tuple[int, int]:
+    """(worst-alternation-path min, max) width of one parsed node, in chars.
+
+    `gw` accumulates per-group widths for backreferences. Overestimating is
+    safe (costs a tier-3 materialisation, which is exact); underestimating is
+    not — so every unrecognised op is (WIDE, WIDE).
+    """
+    op, av = item
+    if op in (_sre_c.LITERAL, _sre_c.NOT_LITERAL, _sre_c.ANY, _sre_c.IN):
+        return (1, 1)
+    if op is _sre_c.AT:
+        return (0, 0)
+    if op in (_sre_c.ASSERT, _sre_c.ASSERT_NOT):
+        return (0, 0)  # zero-width; the lookaround itself is refused earlier
+    if op is _sre_c.SUBPATTERN:
+        gid = av[0]
+        lo, hi = _seq_widths(av[3].data, gw)
+        if gid:
+            gw[gid] = (lo, hi)
+        return (lo, hi)
+    if op is getattr(_sre_c, "ATOMIC_GROUP", None):
+        return _seq_widths(av.data, gw)
+    if op is _sre_c.BRANCH:
+        # min is the MAX over branches: the admission question is "can the
+        # worst path still fail wide", so the pessimistic path is the bound.
+        los, his = zip(*(_seq_widths(b.data, gw) for b in av[1]), strict=True)
+        return (max(los), max(his))
+    if op in (
+        _sre_c.MAX_REPEAT,
+        _sre_c.MIN_REPEAT,
+        getattr(_sre_c, "POSSESSIVE_REPEAT", _sre_c.MAX_REPEAT),
+    ):
+        mn, mx, sub = av
+        lo, hi = _seq_widths(sub.data, gw)
+        top = _WIDE if (mx == _sre_c.MAXREPEAT and hi > 0) else _sat(int(mx) * hi)
+        return (_sat(int(mn) * lo), top)
+    if op is _sre_c.GROUPREF:
+        return gw.get(av, (_WIDE, _WIDE))
+    if op is _sre_c.GROUPREF_EXISTS:
+        gid, yes, no = av
+        ylo, yhi = _seq_widths(yes.data, gw)
+        nlo, nhi = _seq_widths(no.data, gw) if no is not None else (0, 0)
+        return (max(ylo, nlo), max(yhi, nhi))
+    return (_WIDE, _WIDE)
+
+
+def _seq_widths(items, gw: dict) -> tuple[int, int]:
+    lo = hi = 0
+    for it in items:
+        item_lo, item_hi = _node_widths(it, gw)
+        lo, hi = _sat(lo + item_lo), _sat(hi + item_hi)
+    return (lo, hi)
+
+
+def _admissible(items, prefix_hi: int, thresh: int, gw: dict) -> bool:
+    r"""ABR 260803-2100 round 2: admission is judged COMPOSITELY, or not at all.
+
+    Round 1's defects were single units and the round-1 fixes were per-unit
+    guards, so round 2 composed narrow pieces into the same traceless
+    failures: a chain of individually-narrow repeats with a trailing consumer
+    lost a match entirely (`Sa{0,128}b{0,128}c{0,128}d{0,128}\d{0,128}Z`),
+    and a byte-inflated prefix starved an engaged optional into a wrong short
+    span (`S𐍈{65000}(?:\d{60000})?`). The closing rule is the
+    conservative form the review names: a pattern whose worst-case width
+    exceeds the overlap is admitted ONLY as
+
+        NARROW PREFIX  +  ONE width-1-body tail repeat,
+
+    where the prefix's summed worst-case width fits ``thresh`` (chars vs
+    ``overlap // 4``, so the ×4 UTF-8 bound applies to the SUM, in bytes) and
+    the prefix plus the tail's engaged MINIMUM also fits. Then: the prefix
+    always fits the worst runway; the tail consumes one char at a time, so a
+    cut necessarily ends the match AT the window edge — the alarm's signal.
+    Groups/branches unwrap only in tail position; everything else wide is out.
+    """
+    total = _sat(prefix_hi + _seq_widths(items, gw)[1])
+    if total <= thresh:
+        return True  # composite-narrow: every possible match fits the overlap
+    if not items:
+        return False
+    *init, last = items
+    init_hi = _sat(prefix_hi + _seq_widths(init, gw)[1])
+    op, av = last
+    if op is _sre_c.SUBPATTERN:
+        return _admissible(av[3].data, init_hi, thresh, gw)
+    if op is getattr(_sre_c, "ATOMIC_GROUP", None):
+        return _admissible(av.data, init_hi, thresh, gw)
+    if op is _sre_c.BRANCH:
+        return all(_admissible(b.data, init_hi, thresh, gw) for b in av[1])
+    if op in (
+        _sre_c.MAX_REPEAT,
+        _sre_c.MIN_REPEAT,
+        getattr(_sre_c, "POSSESSIVE_REPEAT", _sre_c.MAX_REPEAT),
+    ):
+        mn, mx, sub = av
+        body_lo, body_hi = _seq_widths(sub.data, gw)
+        if body_hi != 1:
+            # A multi-char body RETREATS to an iteration boundary when cut and
+            # ends short of the edge (round 1, finding 1) — no alarm.
+            return False
+        if init_hi > thresh:
+            # The prefix alone may not fit the worst runway (byte-inflated
+            # prefixes are exactly round 2's counterexample b).
+            return False
+        if _sat(init_hi + int(mn)) > thresh:
+            # The engaged minimum must fit, or the attempt fails traceless
+            # (round 1 finding 2, generalised).
+            return False
+        return True
+    return False  # the wide part is not carried by a tail repeat: out
+
+
+def _tier2_span_unprovable(pattern: str, flags: int, overlap_bytes: int) -> bool:
+    """True when tier 2 cannot PROVE this pattern exact on a windowed subject.
+
+    Routing on True costs one tier-3 materialisation and stays exact; a wrong
+    False is the silent-wrong-answer class this file fears, so every branch
+    errs toward True.
+    """
+    thresh = max(1, overlap_bytes // 4)  # chars; a codepoint is <= 4 bytes
+    try:
+        parsed = _sre_p.parse(pattern, flags)
+    except Exception:  # noqa: BLE001 - unparseable here -> let tier 3 decide
+        return True
+    gw: dict = {}
+    _seq_widths(parsed.data, gw)  # populate group widths for backrefs
+    return not _admissible(parsed.data, 0, thresh, gw)
+
+
 def _at_char_boundary(data, byte_off: int, nbytes: int) -> bool:
     """A byte offset is a CHARACTER position only if it is not a continuation
     byte. End-of-buffer always is one."""
@@ -843,7 +1018,11 @@ class TextView:
     # Tier-2 window. 4 MiB of UTF-8 decodes to at most ~16 MiB of UCS-4 — an
     # order below the 125 MiB the whole context costs, and transient.
     WINDOW_BYTES = 4 << 20
-    OVERLAP_BYTES = 1 << 18  # 256 KiB: longer than any recorded match
+    # 256 KiB — completion room for boundary-crossing matches. NOT larger than
+    # every possible match (this corpus's largest document is 27x it): patterns
+    # that could out-span it stay on tier 2 only when truncation is detectable
+    # (tail position); the rest take tier 3 (`_tier2_span_unprovable`).
+    OVERLAP_BYTES = 1 << 18
 
     def __init__(self, mapped: MappedBytes, coords: Coords, label: str = "context"):
         self._bytes = mapped
@@ -1077,44 +1256,64 @@ class TextView:
     def _windowed_finditer(self, pattern: str, flags: int):
         """The ORIGINAL pattern and the ORIGINAL engine on a decoded window.
 
-        **Stated precondition, and it is NOT checked**: tier 2 is exact only
-        while no match exceeds ``OVERLAP_BYTES`` (256 KiB as configured). Nothing verifies that. A
-        violation produces a **silent miss or a wrong span, with no log line** —
-        not an exception, not an escape record, not a slow path. That is the
-        honest statement of what this tier guarantees.
+        **The precondition, now ENFORCED by partition rather than stated.**
+        Tier 2 is exact only while no match exceeds ``OVERLAP_BYTES`` (256 KiB
+        as configured; window growth briefly raised this to 2 x WINDOW_BYTES
+        and was **removed in round 10** — it cost one task 1,097 s against
+        281 s and tripped G3). Historically nothing verified it, and a
+        violation was a **silent miss or a wrong span, with no log line**. The
+        violation cannot be inferred from output: the event is a match that
+        FAILED to complete, absent from the window's output and from any
+        larger probe's, so every proxy tried across nine review rounds read
+        "nothing here" and "nothing here because it broke" identically.
 
-        Nine review rounds established why the violation cannot be inferred. The event to
-        detect is a match that FAILED to complete, and such a match leaves no
-        trace: it is absent from the window's output and equally absent from a
-        larger probe's, so every proxy tried — longest emitted match, an
-        uncovered owned tail, agreement between a window and its extension —
-        reads "nothing here" and "nothing here because it broke" identically.
-        Window growth was built in ABR rounds 6-8 to widen this bound and
-        **removed in round 10**: it cost one task 1,097 s against 281 s
-        without it and tripped G3, so the fixed overlap is what stands.
+        **This corpus VIOLATES the unpartitioned tier's precondition.**
+        Measured over the 46 recorded prompts (46,000 ``<document ...>``
+        blocks): mean 33,212 characters, median 10,329 — but **maximum
+        7,094,565** (``951.txt``), which is **27x the overlap**, and **46 of
+        46** files hold a document larger than it. On the unpartitioned tier,
+        tasks **1203 and 239** ran document-spanning patterns here and found
+        **997 and 998 of 1,000** — silently. An earlier version of this note
+        claimed a "~32 KB longest match, three orders below the bound" — that
+        was the **mean**; a precondition needs the **maximum**, so the margin
+        was **0.04x**, not 8x. G3 cannot see any of this (the oracle compares
+        the replayed call sequence and the final answer, not search results),
+        and it is **not** a consequence of removing growth — the ladder-
+        measured code had none either.
 
-        **This corpus VIOLATES the precondition.** Measured over the 46 recorded
-        prompts (46,000 ``<document ...>`` blocks): mean 33,212 characters,
-        median 10,329 — but **maximum 7,094,565** (``951.txt``), which is **27x
-        the overlap**, and **46 of 46** files hold a document larger than it.
-        Two recorded tasks run document-spanning tier-2 patterns and return
-        silently wrong results on their own prompts: **1203 finds 997 of 1,000,
-        239 finds 998 of 1,000**. An earlier version of this note claimed a
-        "~32 KB longest match, three orders below the bound" — that was the
-        **mean**; a precondition needs the **maximum**, so the margin is not 8x
-        but **0.04x**. G3 cannot see it: the oracle compares the replayed call
-        sequence and the final answer, **not the prompt**, so 46/46
-        ``polluted=0`` is not counter-evidence. It is **not** a consequence of
-        removing window growth — the code the density ladder measured had none
-        either, so this held during that measurement too.
+        **The partition (the successor item named by FR006-CL004, built
+        2026-08-03; admission rule made COMPOSITE by ABR 260803-2100 rounds
+        1-2).** ``_tier2_span_unprovable`` admits a pattern to this tier only
+        when its exactness is provable against the window geometry:
 
-        **Consequence, stated rather than smoothed**: the memory and density
-        results are unaffected (they measure allocation, not match sets), but
-        the *search-correctness* claim is scoped to documents below the overlap
-        until a successor routes document-spanning patterns to tier 3.
+        * **composite-narrow** — the SUMMED worst-case width fits the overlap
+          (chars vs ``overlap // 4``, so the ×4 UTF-8 bound covers the sum in
+          bytes); or
+        * **narrow prefix + one width-1-body tail repeat** — everything before
+          the final repeat fits the overlap, the prefix plus the repeat's
+          engaged MINIMUM fits, and the body consumes exactly one character
+          per iteration, so a truncated match necessarily ends at the
+          window's last character — the ``m.end() == len(text)`` signal
+          below — and escalates to the whole subject.
+
+        Everything else — wide non-tail (the 1203/239 shapes), multi-char
+        iteration bodies (they retreat past the edge signal), wide minimums
+        however wrapped, and compositions of narrow pieces whose sum is wide —
+        takes tier 3, logged ``window:span-unbounded``, exact by
+        construction. The 2g density ladder was measured BEFORE this
+        partition existed; its rows describe the unpartitioned tier and
+        re-measurement is the successor WO's business.
         """
         if _needs_full_subject(pattern):
             _log_escape("window:needs-full-subject")
+            for m in re.finditer(pattern, self._materialize(), flags):
+                yield ViewMatch(self, m, char_span=(m.start(), m.end()))
+            return
+
+        if _tier2_span_unprovable(pattern, flags, self.OVERLAP_BYTES):
+            # The pattern could out-span the overlap and its truncation would
+            # be unobservable — the whole subject is the only sound answer.
+            _log_escape("window:span-unbounded")
             for m in re.finditer(pattern, self._materialize(), flags):
                 yield ViewMatch(self, m, char_span=(m.start(), m.end()))
             return
