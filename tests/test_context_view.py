@@ -801,3 +801,196 @@ def test_mapped_bytes_exposes_a_buffer_re_can_scan(tmp_path):
         assert re.search(rb"beta", mapped.buffer).start() == 6
     finally:
         mapped.close()
+
+
+# --------------------------------------------------------------------------- #
+# tier-2 admission — the tail-position partition (built 2026-08-03, the
+# successor item FR006-CL004 named; ABR rounds 10-11 measured the corpus
+# violating the unpartitioned tier on tasks 1203/239)
+# --------------------------------------------------------------------------- #
+from rlm.context_view import _tier2_span_unprovable  # noqa: E402
+
+_OV = 1 << 18  # production overlap
+
+
+def test_partition_narrow_patterns_stay_on_tier2():
+    """Max width inside the overlap: the classic overlap argument applies."""
+    for pat, fl in [
+        (r"error: [0-9]{1,10}", 0),
+        (r".{0,1000}James Russell.{0,2000}", re.S),  # a real corpus shape
+        (r"<document id=", 0),
+        (r"<document id=(\d{1,20}) url=([^\n>]{1,500})>", 0),
+    ]:
+        assert not _tier2_span_unprovable(pat, fl, _OV), pat
+
+
+def test_partition_unbounded_midpattern_repeat_is_refused_even_when_small():
+    """`\\d+` is statically unbounded, and it is followed by a consumer — so
+    it is refused even though every realistic match is tiny. Admitting it on
+    corpus intuition is exactly the mean-for-maximum error rounds 10-11
+    punished; the bounded spelling (`\\d{1,20}`) keeps tier 2."""
+    assert _tier2_span_unprovable(r"<document id=(\d+) url=([^>]+)>", 0, _OV)
+
+
+def test_partition_wide_nontail_is_refused():
+    """A consumer AFTER the wide part makes truncation evaporate without a
+    trace — the 1203/239 class. Only tier 3 is sound."""
+    for pat, fl in [
+        (r"<document id=\d+ url=[^>]*>.*?</document>", re.S),  # task 1203
+        (r"<document id=.*?</document>", re.DOTALL),           # task 239
+        (r"A.*B", re.S),
+        (r"(A.*)B", re.S),
+        (r"url=[^>]*>", 0),           # statically unbounded negated class
+        (r"(?:A.*)+", re.S),          # wide inside a repeat: iterations follow
+        (r"START.*?END", re.S),
+    ]:
+        assert _tier2_span_unprovable(pat, fl, _OV), pat
+
+
+def test_partition_wide_tail_is_kept():
+    """Every unbounded repeat in tail position: a truncated match must end at
+    the window's last character, which the edge signal observes."""
+    for pat, fl in [
+        (r"ERROR:.*", re.S),
+        (r"A.+", re.S),
+        (r"(A.*|B)", re.S),           # tail on every alternation path
+        (r"B[^x]*", 0),
+    ]:
+        assert not _tier2_span_unprovable(pat, fl, _OV), pat
+
+
+def test_partition_wide_minimum_is_refused():
+    """Tail position alone is not enough: a wide MINIMUM can fail outright
+    near a boundary with no edge-ending match to observe."""
+    assert _tier2_span_unprovable(r".{70000}", re.S, _OV)
+    assert _tier2_span_unprovable(r"(?:X|.{100000})", re.S, _OV)  # worst path
+
+
+def test_wide_nontail_routes_to_tier3_and_is_exact(tmp_path, monkeypatch):
+    """The round-11 failure geometry: a match several times the overlap, with
+    a consumer after the wide part. Pre-partition this returned a silently
+    wrong span; now it takes the whole subject and matches CPython."""
+    monkeypatch.setattr(TextView, "WINDOW_BYTES", 4096)
+    monkeypatch.setattr(TextView, "OVERLAP_BYTES", 512)
+    body = "x" * 3000  # ~6x the overlap
+    text = f"head START {body} END tail é"
+    path = tmp_path / "wide.txt"
+    path.write_text(text, encoding="utf-8")
+    v = TextView.open(path)
+    escape_reset()
+    got = [(m.start(), m.end()) for m in v._re_finditer(r"START.*?END", re.S)]
+    want = [(m.start(), m.end()) for m in re.finditer(r"START.*?END", text, re.S)]
+    assert got == want and len(got) == 1
+    assert escape_snapshot().get("window:span-unbounded") == 1
+
+
+def test_wide_tail_stays_windowed_and_is_exact(tmp_path, monkeypatch):
+    """A tail pattern longer than the window: the in-window match ends at the
+    window edge, the edge signal fires, and the escalation is exact — without
+    the span-unbounded demotion."""
+    monkeypatch.setattr(TextView, "WINDOW_BYTES", 4096)
+    monkeypatch.setattr(TextView, "OVERLAP_BYTES", 512)
+    text = "aaa START" + "y" * 6000 + "\nrest é"
+    path = tmp_path / "tail.txt"
+    path.write_text(text, encoding="utf-8")
+    v = TextView.open(path)
+    escape_reset()
+    got = [(m.start(), m.end()) for m in v._re_finditer(r"START[^\n]*")]
+    want = [(m.start(), m.end()) for m in re.finditer(r"START[^\n]*", text)]
+    assert got == want
+    assert "window:span-unbounded" not in escape_snapshot()
+
+
+def test_partition_multichar_body_tail_is_refused():
+    """ABR 260803-2100 finding 1: a truncated multi-char iteration RETREATS to
+    the last complete iteration and ends short of the window edge, so the edge
+    alarm never fires. Only one-char-per-iteration bodies keep the tail
+    admission."""
+    assert _tier2_span_unprovable(r"X(?:a\d)*", re.S, _OV)
+    assert _tier2_span_unprovable(r"(?:ab){3,}", re.S, _OV)
+    assert not _tier2_span_unprovable(r"X[a-z0-9]*", re.S, _OV)  # 1-char body
+
+
+def test_partition_optional_wide_minimum_is_refused():
+    """ABR 260803-2100 finding 2: `?` hides a wide-minimum sub-attempt from a
+    whole-pattern pin — the engaged attempt fails traceless near a boundary
+    while the empty branch yields a wrong short match. The pin applies per
+    repeat unit."""
+    assert _tier2_span_unprovable(r"S(?:\d{263000})?", re.S, _OV)
+    assert _tier2_span_unprovable(r"S(?:\d{263000}|)", re.S, _OV)  # twin
+
+
+def test_multichar_tail_and_optional_widemin_are_exact_end_to_end(
+    tmp_path, monkeypatch
+):
+    """The two ABR round-1 divergence scenarios, replayed at small geometry:
+    both must now route to tier 3 (span-unbounded) and match CPython."""
+    monkeypatch.setattr(TextView, "WINDOW_BYTES", 4096)
+    monkeypatch.setattr(TextView, "OVERLAP_BYTES", 512)
+
+    text = "pre X" + "a1" * 3000 + " post"
+    p = tmp_path / "b1.txt"
+    p.write_text(text, encoding="utf-8")
+    v = TextView.open(p)
+    escape_reset()
+    got = [(m.start(), m.end()) for m in v._re_finditer(r"X(?:a\d)*", re.S)]
+    want = [(m.start(), m.end()) for m in re.finditer(r"X(?:a\d)*", text, re.S)]
+    assert got == want
+    assert escape_snapshot().get("window:span-unbounded") == 1
+
+    text = "pad " * 300 + "S" + "7" * 200 + " tail"
+    p = tmp_path / "b2.txt"
+    p.write_text(text, encoding="utf-8")
+    v = TextView.open(p)
+    escape_reset()
+    got = [(m.start(), m.end()) for m in v._re_finditer(r"S(?:\d{200})?", 0)]
+    want = [(m.start(), m.end()) for m in re.finditer(r"S(?:\d{200})?", text)]
+    assert got == want
+    assert escape_snapshot().get("window:span-unbounded") == 1
+
+
+def test_partition_composites_are_refused():
+    """ABR 260803-2100 round 2: admission is composite, or unsound. A chain of
+    individually-narrow repeats with a trailing consumer loses a match
+    entirely; a byte-inflated prefix starves an engaged optional into a wrong
+    short span. Both must refuse at the geometry where they are wide."""
+    small = 512
+    assert _tier2_span_unprovable(
+        r"Sa{0,128}b{0,128}c{0,128}d{0,128}\d{0,128}Z", re.S, small)
+    assert _tier2_span_unprovable(
+        r"Sa{0,60000}b{0,60000}c{0,60000}d{0,60000}\d{0,60000}Z", re.S, _OV)
+    assert _tier2_span_unprovable(r"S\U00010348{65000}(?:\d{60000})?", re.S, _OV)
+    assert _tier2_span_unprovable(r"S\U00010348{120}(?:\d{100})?", 0, small)
+    # controls: composite-narrow and fitting-prefix tails stay admitted
+    assert not _tier2_span_unprovable(
+        r"Sa{0,128}b{0,128}c{0,128}d{0,128}\d{0,128}Z", re.S, _OV)
+    assert not _tier2_span_unprovable(r"S\U00010348{120}\d*", 0, small)
+
+
+def test_round2_composites_are_exact_end_to_end(tmp_path, monkeypatch):
+    """The two round-2 divergence scenarios: quarantined and CPython-equal."""
+    monkeypatch.setattr(TextView, "WINDOW_BYTES", 4096)
+    monkeypatch.setattr(TextView, "OVERLAP_BYTES", 512)
+
+    subj = ("x" * 3570) + "S" + "a" * 120 + "b" * 120 + "c" * 120 \
+        + "d" * 120 + "7" * 120 + "Z tail"
+    p = tmp_path / "c1.txt"
+    p.write_text(subj, encoding="utf-8")
+    v = TextView.open(p)
+    escape_reset()
+    pat = r"Sa{0,128}b{0,128}c{0,128}d{0,128}\d{0,128}Z"
+    got = [(m.start(), m.end()) for m in v._re_finditer(pat, re.S)]
+    want = [(m.start(), m.end()) for m in re.finditer(pat, subj, re.S)]
+    assert got == want and len(got) == 1
+    assert escape_snapshot().get("window:span-unbounded") == 1
+
+    subj = ("y" * 3540) + "S" + "\U00010348" * 120 + "5" * 100 + " end"
+    p = tmp_path / "c2.txt"
+    p.write_text(subj, encoding="utf-8")
+    v = TextView.open(p)
+    escape_reset()
+    pat = r"S\U00010348{120}(?:\d{100})?"
+    got = [(m.start(), m.end()) for m in v._re_finditer(pat, 0)]
+    want = [(m.start(), m.end()) for m in re.finditer(pat, subj)]
+    assert got == want
+    assert escape_snapshot().get("window:span-unbounded") == 1
